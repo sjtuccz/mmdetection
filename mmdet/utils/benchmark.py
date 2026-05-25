@@ -188,8 +188,8 @@ class InferenceBenchmark(BaseBenchmark):
         # fp16_cfg = self.cfg.get('fp16', None)
         # if fp16_cfg is not None:
         #     wrap_fp16_model(model)
-
-        load_checkpoint(model, checkpoint, map_location='cpu')
+        if checkpoint:
+            load_checkpoint(model, checkpoint, map_location='cpu')
         if is_fuse_conv_bn:
             model = fuse_conv_bn(model)
 
@@ -274,6 +274,337 @@ class InferenceBenchmark(BaseBenchmark):
 
         return outputs
 
+class TQ_InferenceBenchmark(BaseBenchmark):
+    """The inference benchmark class. It will be statistical inference FPS,
+    CUDA memory and CPU memory information.
+
+    Args:
+        cfg (mmengine.Config): config.
+        checkpoint (str): Accept local filepath, URL, ``torchvision://xxx``,
+            ``open-mmlab://xxx``.
+        distributed (bool): distributed testing flag.
+        is_fuse_conv_bn (bool): Whether to fuse conv and bn, this will
+            slightly increase the inference speed.
+        max_iter (int): maximum iterations of benchmark. Defaults to 2000.
+        log_interval (int): interval of logging. Defaults to 50.
+        num_warmup (int): Number of Warmup. Defaults to 5.
+        logger (MMLogger, optional): Formatted logger used to record messages.
+    """
+
+    def __init__(self,
+                 cfg: Config,
+                 checkpoint: str,
+                 distributed: bool,
+                 is_fuse_conv_bn: bool,
+                 max_iter: int = 2000,
+                 log_interval: int = 50,
+                 num_warmup: int = 5,
+                 logger: Optional[MMLogger] = None):
+        super().__init__(max_iter, log_interval, num_warmup, logger)
+
+        assert get_world_size(
+        ) == 1, 'Inference benchmark does not allow distributed multi-GPU'
+
+        self.cfg = copy.deepcopy(cfg)
+        self.distributed = distributed
+
+        if psutil is None:
+            raise ImportError('psutil is not installed, please install it by: '
+                              'pip install psutil')
+
+        self._process = psutil.Process()
+        env_cfg = self.cfg.get('env_cfg')
+        if env_cfg.get('cudnn_benchmark'):
+            torch.backends.cudnn.benchmark = True
+
+        mp_cfg: dict = env_cfg.get('mp_cfg', {})
+        set_multi_processing(**mp_cfg, distributed=self.distributed)
+
+        print_log('before build: ', self.logger)
+        print_process_memory(self._process, self.logger)
+
+        self.model = self._init_model(checkpoint, is_fuse_conv_bn)
+
+        # Because multiple processes will occupy additional CPU resources,
+        # FPS statistics will be more unstable when num_workers is not 0.
+        # It is reasonable to set num_workers to 0.
+        dataloader_cfg = cfg.test_dataloader
+        dataloader_cfg['num_workers'] = 0
+        dataloader_cfg['batch_size'] = 1
+        dataloader_cfg['persistent_workers'] = False
+        self.data_loader = Runner.build_dataloader(dataloader_cfg)
+
+        print_log('after build: ', self.logger)
+        print_process_memory(self._process, self.logger)
+
+    def _init_model(self, checkpoint: str, is_fuse_conv_bn: bool) -> nn.Module:
+        """Initialize the model."""
+        model = MODELS.build(self.cfg.model)
+        if hasattr(model.backbone, 'reparameterize') and callable(model.backbone.reparameterize):
+            model.backbone.reparameterize()
+        # print("\n" + "="*50)
+        # print("模型结构预览:")
+        # print(model)
+        # print("="*50 + "\n")
+        # TODO need update
+        # fp16_cfg = self.cfg.get('fp16', None)
+        # if fp16_cfg is not None:
+        #     wrap_fp16_model(model)
+        if checkpoint:
+            load_checkpoint(model, checkpoint, map_location='cpu')
+        if is_fuse_conv_bn:
+            model = fuse_conv_bn(model)
+
+        model = model.cuda()
+
+        if self.distributed:
+            model = DistributedDataParallel(
+                model,
+                device_ids=[torch.cuda.current_device()],
+                broadcast_buffers=False,
+                find_unused_parameters=False)
+
+        model.eval()
+        return model
+
+    def run_once(self) -> dict:
+        """Executes the benchmark once."""
+        pure_inf_time = 0
+        fps = 0
+
+        for i, data in enumerate(self.data_loader):
+
+            if (i + 1) % self.log_interval == 0:
+                print_log('==================================', self.logger)
+
+            torch.cuda.synchronize()
+            start_time = time.perf_counter()
+
+            with torch.no_grad():
+                self.model.test_step(data)
+
+            torch.cuda.synchronize()
+            elapsed = time.perf_counter() - start_time
+
+            if i >= self.num_warmup:
+                pure_inf_time += elapsed
+                if (i + 1) % self.log_interval == 0:
+                    fps = (i + 1 - self.num_warmup) / pure_inf_time
+                    cuda_memory = get_max_cuda_memory()
+
+                    print_log(
+                        f'Done image [{i + 1:<3}/{self.max_iter}], '
+                        f'fps: {fps:.1f} img/s, '
+                        f'times per image: {1000 / fps:.1f} ms/img, '
+                        f'cuda memory: {cuda_memory} MB', self.logger)
+                    print_process_memory(self._process, self.logger)
+
+            if (i + 1) == self.max_iter:
+                fps = (i + 1 - self.num_warmup) / pure_inf_time
+                break
+
+        return {'fps': fps}
+
+    def average_multiple_runs(self, results: List[dict]) -> dict:
+        """Average the results of multiple runs."""
+        print_log('============== Done ==================', self.logger)
+
+        fps_list_ = [round(result['fps'], 1) for result in results]
+        avg_fps_ = sum(fps_list_) / len(fps_list_)
+        outputs = {'avg_fps': avg_fps_, 'fps_list': fps_list_}
+
+        if len(fps_list_) > 1:
+            times_pre_image_list_ = [
+                round(1000 / result['fps'], 1) for result in results
+            ]
+            avg_times_pre_image_ = sum(times_pre_image_list_) / len(
+                times_pre_image_list_)
+
+            print_log(
+                f'Overall fps: {fps_list_}[{avg_fps_:.1f}] img/s, '
+                'times per image: '
+                f'{times_pre_image_list_}[{avg_times_pre_image_:.1f}] '
+                'ms/img', self.logger)
+        else:
+            print_log(
+                f'Overall fps: {fps_list_[0]:.1f} img/s, '
+                f'times per image: {1000 / fps_list_[0]:.1f} ms/img',
+                self.logger)
+
+        print_log(f'cuda memory: {get_max_cuda_memory()} MB', self.logger)
+        print_process_memory(self._process, self.logger)
+
+        return outputs
+class TQ_InferenceBenchmark_excludeIO(BaseBenchmark):
+    """The inference benchmark class using random input tensors.
+    It will be statistical inference FPS, CUDA memory and CPU memory information.
+    """
+
+    def __init__(self,
+                 cfg: Config,
+                 checkpoint: str,
+                 distributed: bool,
+                 is_fuse_conv_bn: bool,
+                 max_iter: int = 2000,
+                 log_interval: int = 50,
+                 num_warmup: int = 5,
+                 logger: Optional[MMLogger] = None):
+        super().__init__(max_iter, log_interval, num_warmup, logger)
+
+        assert get_world_size() == 1, 'Inference benchmark does not allow distributed multi-GPU'
+
+        self.cfg = copy.deepcopy(cfg)
+        self.distributed = distributed
+
+        if psutil is None:
+            raise ImportError('psutil is not installed, please install it by: '
+                              'pip install psutil')
+
+        self._process = psutil.Process()
+        env_cfg = self.cfg.get('env_cfg')
+        if env_cfg.get('cudnn_benchmark'):
+            torch.backends.cudnn.benchmark = True
+
+        mp_cfg: dict = env_cfg.get('mp_cfg', {})
+        set_multi_processing(**mp_cfg, distributed=self.distributed)
+
+        print_log('before build: ', self.logger)
+        print_process_memory(self._process, self.logger)
+
+        # 1. 初始化模型
+        self.model = self._init_model(checkpoint, is_fuse_conv_bn)
+
+        # 2. 不再构建 DataLoader，而是准备随机输入
+        # 从配置中获取输入尺寸，如果没有则默认为 (3, 800, 1216) 或根据你的模型调整
+        # 这里假设是 COCO 数据集常用的尺寸，或者你可以硬编码为 (3, 640, 640) 等
+        data_preprocessor = self.cfg.model.get('data_preprocessor', {})
+        input_size = data_preprocessor.get('input_size', (3, 1280, 800))
+        print(f'input size : {input_size}')
+        dummy_tensor = torch.randn(1, *input_size).cuda()
+
+        
+        # 创建固定的随机输入张量 (Batch=1, C, H, W)
+        # 使用 cuda() 将数据直接放到显卡上，避免 CPU->GPU 拷贝的时间计入推理耗时
+        
+        from mmdet.structures import DetDataSample
+        fake_data_sample = DetDataSample()
+        h, w = input_size[1], input_size[2]
+        fake_data_sample.set_metainfo({
+            'img_id': 0,
+            'img_path': 'fake_path.jpg', # 某些后处理可能会检查路径
+            'ori_shape': (h, w),        # 原始图像尺寸
+            'img_shape': (h, w),        # 当前图像尺寸（推理时通常等于 pad_shape）
+            'pad_shape': (h, w),        # 填充后的尺寸
+            'scale_factor': (1.0, 1.0), # 【关键修复】缩放比例，必须是 4 个值的元组或列表
+            'batch_input_shape': (h, w)
+        })
+        self.dummy_input = {
+            'inputs': dummy_tensor,  # 注意：inputs 通常期望是一个列表（List[Tensor]）
+            'data_samples': [fake_data_sample] # data_samples 必须是一个列表
+        }
+
+
+
+        print_log(f'Random input shape: {dummy_tensor.shape}', self.logger)
+        print_log('after build: ', self.logger)
+        print_process_memory(self._process, self.logger)
+
+    def _init_model(self, checkpoint: str, is_fuse_conv_bn: bool) -> nn.Module:
+        """Initialize the model."""
+        model = MODELS.build(self.cfg.model)
+        
+        # 调用 reparameterize (针对你的 ConvNeXt-TQ 模型)
+        if hasattr(model.backbone, 'reparameterize'):
+            model.backbone.reparameterize()
+            
+        if checkpoint:
+            load_checkpoint(model, checkpoint, map_location='cpu')
+        if is_fuse_conv_bn:
+            model = fuse_conv_bn(model)
+
+        model = model.cuda()
+
+        if self.distributed:
+            model = DistributedDataParallel(
+                model,
+                device_ids=[torch.cuda.current_device()],
+                broadcast_buffers=False,
+                find_unused_parameters=False)
+
+        model.eval()
+        return model
+
+    def run_once(self) -> dict:
+        """Executes the benchmark once using random tensors."""
+        pure_inf_time = 0
+        fps = 0
+
+        for i in range(self.max_iter):
+
+            if (i + 1) % self.log_interval == 0:
+                print_log('==================================', self.logger)
+
+            torch.cuda.synchronize()
+            start_time = time.perf_counter()
+
+            with torch.no_grad():
+                # 3. 直接使用随机张量进行推理
+                # 注意：这里不再使用 test_step，因为 test_step 需要复杂的 DataSample 结构
+                # 直接调用 forward 或 simple_inference 是最纯粹的速度测试
+                self.model.test_step(self.dummy_input)
+
+            torch.cuda.synchronize()
+            elapsed = time.perf_counter() - start_time
+
+            if i >= self.num_warmup:
+                pure_inf_time += elapsed
+                if (i + 1) % self.log_interval == 0:
+                    fps = (i + 1 - self.num_warmup) / pure_inf_time
+                    cuda_memory = get_max_cuda_memory()
+
+                    print_log(
+                        f'Done iter [{i + 1:<3}/{self.max_iter}], '
+                        f'fps: {fps:.1f} img/s, '
+                        f'times per image: {1000 / fps:.1f} ms/img, '
+                        f'cuda memory: {cuda_memory} MB', self.logger)
+                    print_process_memory(self._process, self.logger)
+
+            if (i + 1) == self.max_iter:
+                fps = (i + 1 - self.num_warmup) / pure_inf_time
+                break
+
+        return {'fps': fps}
+
+    def average_multiple_runs(self, results: List[dict]) -> dict:
+        """Average the results of multiple runs."""
+        print_log('============== Done ==================', self.logger)
+
+        fps_list_ = [round(result['fps'], 1) for result in results]
+        avg_fps_ = sum(fps_list_) / len(fps_list_)
+        outputs = {'avg_fps': avg_fps_, 'fps_list': fps_list_}
+
+        if len(fps_list_) > 1:
+            times_pre_image_list_ = [
+                round(1000 / result['fps'], 1) for result in results
+            ]
+            avg_times_pre_image_ = sum(times_pre_image_list_) / len(
+                times_pre_image_list_)
+
+            print_log(
+                f'Overall fps: {fps_list_}[{avg_fps_:.1f}] img/s, '
+                'times per image: '
+                f'{times_pre_image_list_}[{avg_times_pre_image_:.1f}] '
+                'ms/img', self.logger)
+        else:
+            print_log(
+                f'Overall fps: {fps_list_[0]:.1f} img/s, '
+                f'times per image: {1000 / fps_list_[0]:.1f} ms/img',
+                self.logger)
+
+        print_log(f'cuda memory: {get_max_cuda_memory()} MB', self.logger)
+        print_process_memory(self._process, self.logger)
+
+        return outputs
 
 class DataLoaderBenchmark(BaseBenchmark):
     """The dataloader benchmark class. It will be statistical inference FPS and

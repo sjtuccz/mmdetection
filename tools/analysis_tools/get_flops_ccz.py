@@ -1,4 +1,8 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+
+
+#  python tools/analysis_tools/get_flops_ccz.py ccz/mask-rcnn_convnext-t-p4-w7_fpn_amp-ms-crop-3x_coco.py
+
 import argparse
 import tempfile
 from functools import partial
@@ -26,10 +30,11 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Get a detector flops')
     parser.add_argument('config', help='train config file path')
     parser.add_argument(
-        '--num-images',
+        '--shape',
         type=int,
-        default=10,
-        help='num images of calculate model flops')
+        nargs=2,
+        default=[1280, 800],
+        help='input image size (height width)')
     parser.add_argument(
         '--cfg-options',
         nargs='+',
@@ -57,7 +62,6 @@ def inference(args, logger):
         logger.error(f'{config_name} not found.')
 
     cfg = Config.fromfile(args.config)
-    cfg.val_dataloader.batch_size = 1
     cfg.work_dir = tempfile.TemporaryDirectory().name
 
     if args.cfg_options is not None:
@@ -77,39 +81,59 @@ def inference(args, logger):
             type='SyncBN', requires_grad=True)
 
     result = {}
-    avg_flops = []
-    data_loader = Runner.build_dataloader(cfg.val_dataloader)
     model = MODELS.build(cfg.model)
+    if hasattr(model.backbone, 'reparameterize'):
+        model.backbone.reparameterize()
     if torch.cuda.is_available():
         model = model.cuda()
     model = revert_sync_batchnorm(model)
     model.eval()
+
+    # 手动构建随机输入
+    height, width = args.shape
+    dummy_input = torch.randn(1, 3, height, width)
+    if torch.cuda.is_available():
+        dummy_input = dummy_input.cuda()
+
+    # 创建伪 data_samples（部分模型需要）
+    from mmengine.structures import InstanceData
+    from mmdet.structures import DetDataSample
+    data_samples = [DetDataSample()]
+    data_samples[0].set_metainfo({
+        'img_shape': (height, width),
+        'ori_shape': (height, width),
+        'pad_shape': (height, width),
+        'scale_factor': (1.0, 1.0),
+        'batch_input_shape': (height, width),
+    })
+    data_samples[0].gt_instances = InstanceData()
+    data_samples[0].gt_instances.bboxes = torch.zeros((0, 4), dtype=torch.float32)
+    data_samples[0].gt_instances.labels = torch.zeros((0, ), dtype=torch.long)
+
+    # 构建输入字典
+    data = {
+        'inputs': dummy_input,
+        'data_samples': data_samples
+    }
+
+    # 使用 partial 绑定 data_samples
     _forward = model.forward
+    model.forward = partial(_forward, data_samples=data['data_samples'])
 
-    for idx, data_batch in enumerate(data_loader):
-        if idx == args.num_images:
-            break
-        data = model.data_preprocessor(data_batch)
-        result['ori_shape'] = data['data_samples'][0].ori_shape
-        result['pad_shape'] = data['data_samples'][0].pad_shape
-        if hasattr(data['data_samples'][0], 'batch_input_shape'):
-            result['pad_shape'] = data['data_samples'][0].batch_input_shape
-        model.forward = partial(_forward, data_samples=data['data_samples'])
-        outputs = get_model_complexity_info(
-            model,
-            None,
-            inputs=data['inputs'],
-            show_table=False,
-            show_arch=False)
-        avg_flops.append(outputs['flops'])
-        params = outputs['params']
-        result['compute_type'] = 'dataloader: load a picture from the dataset'
-    del data_loader
+    outputs = get_model_complexity_info(
+        model,
+        None,
+        inputs=data['inputs'],
+        show_table=False,
+        show_arch=False)
 
-    mean_flops = _format_size(int(np.average(avg_flops)))
-    params = _format_size(params)
-    result['flops'] = mean_flops
-    result['params'] = params
+    flops = outputs['flops']
+    params = outputs['params']
+    result['compute_type'] = 'direct: randomly generate a picture'
+    result['ori_shape'] = (height, width)
+    result['pad_shape'] = (height, width)
+    result['flops'] = _format_size(flops)
+    result['params'] = _format_size(params)
 
     return result
 

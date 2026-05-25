@@ -4,6 +4,7 @@ from .beit import BEiTViT
 from .conformer import Conformer
 from .convmixer import ConvMixer
 from .convnext import ConvNeXt
+from .convnext_tq import TQ_ConvNeXt
 from .cspnet import CSPDarkNet, CSPNet, CSPResNet, CSPResNeXt
 from .davit import DaViT
 from .deit import DistilledVisionTransformer
@@ -126,4 +127,5 @@ __all__ = [
     'HiViT',
     'SparseResNet',
     'SparseConvNeXt',
+    'TQ_ConvNeXt'
 ]
